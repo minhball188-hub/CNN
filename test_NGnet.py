@@ -3,13 +3,11 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 from skimage import measure
 from skimage.measure import approximate_polygon
-from scipy.interpolate import interp1d, UnivariateSpline, splprep, splev
-from scipy.ndimage import gaussian_filter, gaussian_filter1d
+from scipy import ndimage
 import ezdxf
-import os
 
 # ==========================================
-# PHẦN 1: SINH HÌNH (NGNET + MAGNET)
+# PHẦN 1: SINH HÌNH
 # ==========================================
 
 def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
@@ -24,490 +22,236 @@ def ngnet_generate_shape(weights, centers, grid_x, grid_y, sigma):
     return function_value / sum_gaussian
 
 # --- THIẾT LẬP ---
-R_out = 39; R_in = 16.0; resolution = 1000 # Tăng độ phân giải lên 600 cho mịn hơn (có thể tăng lên 800 nếu máy đủ mạnh)
+np.random.seed(1)  # Fixed seed để kiểm tra mirror
+R_out = 39; R_in = 16.0; resolution = 1000
 x = np.linspace(0, R_out, resolution)
 y = np.linspace(0, R_out, resolution)
 GX, GY = np.meshgrid(x, y)
 
-# Tính tỷ lệ quy đổi từ Pixel sang mm (Quan trọng để xuất DXF đúng kích thước)
 pixel_size_x = R_out / (resolution - 1)
 pixel_size_y = R_out / (resolution - 1)
 
-# Mask Rotor
 radius = np.sqrt(GX**2 + GY**2)
 angle = np.arctan2(GY, GX) * 180 / np.pi
 mask_rotor_region = (radius >= R_in) & (radius <= R_out) & (angle >= 0) & (angle <= 90)
 
+# Mask cho vùng NGnet - có margin ở biên 0° và 90° để air KHÔNG chạm biên cắt của Ansys
+ANGLE_MARGIN = 0.1  # độ - khoảng cách từ biên 0° và 90°
+mask_ngnet_region = (radius >= R_in) & (radius <= R_out) & \
+                    (angle >= ANGLE_MARGIN) & (angle <= 90 - ANGLE_MARGIN)
+
 # ==========================================
-# TẠO NAM CHÂM NGẪU NHIÊN (GIỐNG NGNET)
+# NAM CHÂM
 # ==========================================
 def generate_random_magnet_config(R_in, R_out, num_magnets=1):
-    """
-    Tạo cấu hình nam châm ngẫu nhiên trong vùng rotor
-    
-    Parameters:
-    - R_in, R_out: Bán kính trong và ngoài của rotor
-    - num_magnets: Số lượng nam châm cần tạo
-    
-    Returns:
-    - List các dictionary chứa tham số nam châm
-    """
     magnets = []
     for _ in range(num_magnets):
-        # Tạo vị trí tâm ngẫu nhiên trong vùng rotor (dạng cực)
-        # R: từ R_in+margin đến R_out-margin
-        # Theta: từ 0 đến 90 độ
-        margin = 3.0  # Margin để đảm bảo nam châm không sát biên
+        margin = 3.0
         r_center = np.random.uniform(R_in + margin, R_out - margin)
-        theta_center = np.random.uniform(2, 88)  # Độ, tránh sát biên góc
-        
-        # Chuyển sang tọa độ Descartes
+        theta_center = np.random.uniform(2, 88)
         center_x = r_center * np.cos(np.deg2rad(theta_center))
         center_y = r_center * np.sin(np.deg2rad(theta_center))
-        
-        # Kích thước ngẫu nhiên (có thể điều chỉnh phạm vi)
-        width = np.random.uniform(12, 20)        # Chiều rộng: 12-20 mm
-        thickness = np.random.uniform(2.5, 5.0)  # Độ dày: 2.5-5 mm
-        
-        # Góc nghiêng ngẫu nhiên
-        angle = np.random.uniform(0, 90)         # Góc: 0-90 độ
-        
-        magnets.append({
-            'center_x': center_x,
-            'center_y': center_y,
-            'width': width,
-            'thickness': thickness,
-            'angle': angle
-        })
-    
+        width = np.random.uniform(12, 20)
+        thickness = np.random.uniform(2.5, 5.0)
+        ang = np.random.uniform(0, 90)
+        magnets.append({'center_x': center_x, 'center_y': center_y, 
+                       'width': width, 'thickness': thickness, 'angle': ang})
     return magnets
 
-# Sinh ngẫu nhiên nam châm (giống như NGnet random)
-# Có thể thay đổi num_magnets để tạo nhiều nam châm
-magnets_config = generate_random_magnet_config(R_in, R_out, num_magnets=1)
-
 def create_magnet_mask(GX, GY, center_x, center_y, width, thickness, angle, region_mask):
-    """
-    Tạo mask cho một nam châm hình chữ nhật với các tham số có thể điều chỉnh
-    
-    Parameters:
-    - GX, GY: Lưới tọa độ
-    - center_x, center_y: Vị trí tâm nam châm (mm)
-    - width: Chiều rộng nam châm (mm)
-    - thickness: Độ dày nam châm (mm)
-    - angle: Góc nghiêng (độ)
-    - region_mask: Mask vùng cho phép (ví dụ: mask_rotor_region)
-    
-    Returns:
-    - mask: Boolean mask cho nam châm
-    """
-    # Chuyển tọa độ về hệ tọa độ tâm nam châm
     dX = GX - center_x
     dY = GY - center_y
-    
-    # Xoay hệ tọa độ theo góc nghiêng
     angle_rad = np.deg2rad(angle)
     rotated_X = dX * np.cos(angle_rad) + dY * np.sin(angle_rad)
     rotated_Y = -dX * np.sin(angle_rad) + dY * np.cos(angle_rad)
-    
-    # Tạo mask hình chữ nhật trong hệ tọa độ đã xoay
-    mask = (np.abs(rotated_X) <= width/2) & \
-           (np.abs(rotated_Y) <= thickness/2) & \
-           region_mask
-    
-    return mask
+    return (np.abs(rotated_X) <= width/2) & (np.abs(rotated_Y) <= thickness/2) & region_mask
 
-# --- TẠO NAM CHÂM TỪ CẤU HÌNH ---
+magnets_config = generate_random_magnet_config(R_in, R_out, num_magnets=1)
 mask_magnet = np.zeros_like(GX, dtype=bool)
-print(f"--- THÔNG TIN NAM CHÂM (NGẪU NHIÊN) ---")
-for i, magnet in enumerate(magnets_config):
-    print(f"Nam châm {i+1}:")
-    print(f"  - Vị trí: ({magnet['center_x']:.2f}, {magnet['center_y']:.2f}) mm")
-    print(f"  - Chiều rộng: {magnet['width']:.2f} mm")
-    print(f"  - Độ dày: {magnet['thickness']:.2f} mm")
-    print(f"  - Góc nghiêng: {magnet['angle']:.2f} độ")
-    
-    mag_mask = create_magnet_mask(
-        GX, GY,
-        magnet['center_x'],
-        magnet['center_y'],
-        magnet['width'],
-        magnet['thickness'],
-        magnet['angle'],
-        mask_rotor_region
-    )
-    mask_magnet = mask_magnet | mag_mask
-print()
+for m in magnets_config:
+    mask_magnet |= create_magnet_mask(GX, GY, m['center_x'], m['center_y'],
+                                       m['width'], m['thickness'], m['angle'], mask_rotor_region)
 
-# --- TẠO NGNET (Topology) ---
+print(f"Nam châm: pos=({magnets_config[0]['center_x']:.1f}, {magnets_config[0]['center_y']:.1f})")
+
+# ==========================================
+# NGNET 0-45° + MIRROR
+# ==========================================
 centers = []
 for r in np.linspace(R_in+2, R_out-2, 6):
-    for theta in np.linspace(2, 88, 6):
+    for theta in np.linspace(2, 43, 6):
         centers.append([r * np.cos(np.deg2rad(theta)), r * np.sin(np.deg2rad(theta))])
 
-weights = np.random.uniform(-2.0, 2.0, len(centers)) 
+weights = np.random.uniform(-2.0, 2.0, len(centers))
 phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
 
-# --- TỔNG HỢP ---
-# 0: Khí, 1: Sắt, 2: Nam châm
-# QUAN TRỌNG: Thứ tự gán giá trị phải đúng để nam châm không bị cắt bởi sắt
-# Nam châm chỉ bị cắt bởi bán kính giới hạn (R_in, R_out), không bị cắt bởi sắt
+# Mirror
+phi_mirrored = phi_value.copy()
+ang = np.arctan2(GY, GX) * 180 / np.pi
+mask_45_90 = ang > 45
+phi_mirrored[mask_45_90] = phi_value.T[mask_45_90]
 
-final_design = np.full_like(GX, -1) # -1 là nền
+# Tổng hợp
+# Dùng mask_ngnet_region cho flux barrier để KHÔNG chạm biên 0° và 90°
+final_design = np.full_like(GX, -1)
+final_design[mask_rotor_region] = 1  # Toàn bộ rotor là sắt
+final_design[(phi_mirrored < 0) & mask_ngnet_region] = 0  # Air chỉ trong vùng có margin
+final_design[mask_magnet] = 0  # Vùng nam châm cũng là air (khoét lỗ cho nam châm)
 
-# BƯỚC 1: Gán nam châm TRƯỚC (ưu tiên cao nhất)
-# Nam châm có thể bị cắt bởi bán kính giới hạn (mask_rotor_region đã xử lý điều này)
-# Nhưng nam châm KHÔNG bị cắt bởi sắt hay flux barrier
-final_design[mask_magnet] = 2  # Nam châm
-
-# BƯỚC 2: Gán flux barrier (không khí) - nhưng KHÔNG ghi đè lên nam châm
-flux_barrier_mask = (phi_value < 0) & mask_rotor_region & (final_design != 2)
-final_design[flux_barrier_mask] = 0  # Khí (chỉ ở vùng không phải nam châm)
-
-# BƯỚC 3: Gán sắt - nhưng KHÔNG ghi đè lên nam châm và flux barrier
-# Sắt chỉ được gán ở vùng rotor, trừ vùng nam châm và flux barrier
-iron_mask = mask_rotor_region & (final_design == -1)
-final_design[iron_mask] = 1  # Sắt (chỉ ở vùng không phải nam châm và không phải flux barrier)
+# Tạo riêng mask cho nam châm để export riêng
+magnet_design = np.full_like(GX, -1)
+magnet_design[mask_magnet] = 2
 
 # ==========================================
-# PHẦN 2: XUẤT DXF (QUAN TRỌNG)
+# NỘI SUY PIXEL - TRACE BOUNDARY
 # ==========================================
 
-def smooth_contour_simple(contour_points, num_points=None):
+def trace_boundary_pixels(binary_mask):
     """
-    Làm mịn đơn giản: chỉ resample với nhiều điểm hơn, không dùng spline phức tạp
-    Giữ nguyên hình dạng, chỉ làm mịn bằng cách tăng số điểm
-    Đây là phương pháp an toàn nhất, không gây biến dạng
+    Trace boundary của vùng binary mask
+    Dùng find_contours với padding để không bị cắt ở biên
     """
-    if len(contour_points) < 4:
-        return contour_points
+    from skimage import measure
+    from scipy import ndimage
     
-    points = np.array(contour_points)
-    if not np.allclose(points[0], points[-1]):
-        points = np.vstack([points, points[0:1]])
+    # Label các vùng riêng biệt TRƯỚC
+    labeled, num_features = ndimage.label(binary_mask)
     
-    # Tính khoảng cách tích lũy
-    diffs = np.diff(points, axis=0)
-    dists = np.sqrt(np.sum(diffs**2, axis=1))
-    cumdist = np.concatenate([[0], np.cumsum(dists)])
+    all_contours = []
     
-    if cumdist[-1] < 1e-6:
-        return contour_points
+    for label_id in range(1, num_features + 1):
+        region = (labeled == label_id)
+        
+        # Pad từng region riêng
+        padded = np.pad(region, pad_width=2, mode='constant', constant_values=False)
+        
+        # Tìm contour
+        contours = measure.find_contours(padded.astype(float), level=0.5)
+        
+        for contour in contours:
+            # Trừ padding offset và làm tròn về pixel
+            adjusted = [(p[0] - 2, p[1] - 2) for p in contour]
+            if len(adjusted) >= 3:
+                all_contours.append(adjusted)
     
-    cumdist_norm = cumdist / cumdist[-1]
-    
-    # Xác định số điểm mới
-    if num_points is None:
-        num_points = max(len(points) * 2, 100)
-    
-    # Chỉ dùng linear interpolation - đơn giản và an toàn, KHÔNG gây lòi ra ngoài
-    u_new = np.linspace(0, 1, num_points)
-    f_x = interp1d(cumdist_norm, points[:, 0], kind='linear', 
-                   bounds_error=False, fill_value=(points[0, 0], points[-1, 0]),
-                   assume_sorted=True)
-    f_y = interp1d(cumdist_norm, points[:, 1], kind='linear',
-                   bounds_error=False, fill_value=(points[0, 1], points[-1, 1]),
-                   assume_sorted=True)
-    
-    u_new_safe = np.clip(u_new, cumdist_norm[0], cumdist_norm[-1])
-    x_new = f_x(u_new_safe)
-    y_new = f_y(u_new_safe)
-    
-    # Đóng đường bao
-    x_new[-1] = x_new[0]
-    y_new[-1] = y_new[0]
-    
-    return np.column_stack([x_new[:-1], y_new[:-1]]).tolist()
+    return all_contours
 
-def smooth_contour_bspline_safe(contour_points, smoothing_strength='medium'):
-    """
-    Làm mịn bằng B-spline an toàn với validation để tránh lòi ra ngoài
-    
-    Parameters:
-    - contour_points: Array các điểm (x, y) của đường bao
-    - smoothing_strength: 'light' (giữ nguyên shape), 'medium' (cân bằng), 'strong' (mịn hơn)
-    """
-    if len(contour_points) < 4:
-        return contour_points
-    
-    points = np.array(contour_points)
-    if not np.allclose(points[0], points[-1]):
-        points = np.vstack([points, points[0:1]])
-    
-    # QUAN TRỌNG: Tính bounding box của contour gốc để giới hạn phạm vi
-    x_min_orig = np.min(points[:, 0])
-    x_max_orig = np.max(points[:, 0])
-    y_min_orig = np.min(points[:, 1])
-    y_max_orig = np.max(points[:, 1])
-    
-    # Thêm margin nhỏ (1% mỗi phía) để tránh clip quá chặt
-    x_range = x_max_orig - x_min_orig
-    y_range = y_max_orig - y_min_orig
-    margin_x = max(x_range * 0.01, 0.1)
-    margin_y = max(y_range * 0.01, 0.1)
-    
-    x_min_clip = x_min_orig - margin_x
-    x_max_clip = x_max_orig + margin_x
-    y_min_clip = y_min_orig - margin_y
-    y_max_clip = y_max_orig + margin_y
-    
-    # Xác định tham số smoothing
-    if smoothing_strength == 'light':
-        s = 0.0  # Interpolation (giữ nguyên shape hoàn toàn)
-        num_mult = 2
-    elif smoothing_strength == 'medium':
-        s = len(points) * 0.0005  # Giảm s xuống để tránh ngoại suy
-        num_mult = 2
-    else:  # strong
-        s = len(points) * 0.001  # Giảm s xuống
-        num_mult = 2.5
-    
-    try:
-        # B-spline với periodic boundary (đóng đường bao)
-        tck, u = splprep([points[:, 0], points[:, 1]], s=s, k=3, per=True)
-        u_new = np.linspace(0, 1, int(len(points) * num_mult))
-        x_new, y_new = splev(u_new, tck)
-        
-        # QUAN TRỌNG: Clip các điểm về phạm vi hợp lệ để tránh lòi ra ngoài
-        x_new = np.clip(x_new, x_min_clip, x_max_clip)
-        y_new = np.clip(y_new, y_min_clip, y_max_clip)
-        
-        # Đóng đường bao
-        x_new[-1] = x_new[0]
-        y_new[-1] = y_new[0]
-        
-        result = np.column_stack([x_new[:-1], y_new[:-1]])
-        
-        # Validation bổ sung: kiểm tra xem có điểm nào bị clip quá nhiều không
-        # Nếu phạm vi mới nhỏ hơn phạm vi gốc quá nhiều, có thể có vấn đề
-        x_range_new = np.max(result[:, 0]) - np.min(result[:, 0])
-        y_range_new = np.max(result[:, 1]) - np.min(result[:, 1])
-        
-        if x_range > 0 and (x_range_new / x_range < 0.5):
-            # Nếu bị shrink quá nhiều, dùng simple method
-            return smooth_contour_simple(contour_points)
-        if y_range > 0 and (y_range_new / y_range < 0.5):
-            return smooth_contour_simple(contour_points)
-        
-        return result.tolist()
-    except Exception as e:
-        # Fallback về simple nếu B-spline fail
-        return smooth_contour_simple(contour_points)
+def downsample_contour(contour, step=5):
+    """Giảm số điểm trong contour bằng cách lấy mỗi step điểm"""
+    if len(contour) <= step * 2:
+        return contour
+    return contour[::step]
 
-def smooth_contour(contour_points, smoothing_factor=2.0, num_points=None, method='bspline'):
+def export_air_holes_pixel_trace(matrix, GX, GY, pixel_size_x, pixel_size_y, msp, layer_name, downsample_step=3):
     """
-    Làm mịn đường bao với nhiều phương pháp
-    
-    Parameters:
-    - contour_points: Array các điểm (x, y) của đường bao
-    - smoothing_factor: Độ mịn (chỉ dùng với method='advanced')
-    - num_points: Số điểm sau khi làm mịn (None = tự động)
-    - method: 'bspline' (B-spline an toàn - KHUYẾN NGHỊ), 
-              'simple' (chỉ resample, an toàn), 
-              'none' (không làm mịn), 
-              'advanced' (spline phức tạp, có thể gây biến dạng)
+    Export air holes bằng cách trace boundary pixels
     """
-    if method == 'none':
-        return contour_points
+    binary_mask = (matrix == 0).astype(bool)
     
-    if method == 'bspline':
-        return smooth_contour_bspline_safe(contour_points, smoothing_strength='medium')
+    contours = trace_boundary_pixels(binary_mask)
     
-    if method == 'simple':
-        return smooth_contour_simple(contour_points, num_points)
+    count = 0
+    for contour in contours:
+        if len(contour) < 10:
+            continue
+        
+        # Downsample để giảm số điểm (tránh file quá nặng)
+        contour_ds = downsample_contour(contour, step=downsample_step)
+        
+        # Chuyển sang mm
+        points_mm = []
+        for row, col in contour_ds:
+            x_mm = col * pixel_size_x
+            y_mm = row * pixel_size_y
+            points_mm.append((x_mm, y_mm))
+        
+        if len(points_mm) < 4:
+            continue
+        
+        # Đóng contour
+        if points_mm[0] != points_mm[-1]:
+            points_mm.append(points_mm[0])
+        
+        msp.add_lwpolyline(points_mm, close=True, dxfattribs={'layer': layer_name})
+        count += 1
     
-    # method == 'advanced' - phương pháp phức tạp hơn (có thể gây biến dạng)
-    # Khuyến nghị: dùng 'bspline' thay vì 'advanced'
-    return smooth_contour_simple(contour_points, num_points)
+    return count, contours  # Trả về contours để vẽ
 
-def snap_to_axis_boundary(x, y, snap_tolerance=0.5):
-    """
-    Snap điểm về 2 biên đặc biệt (x=0 và y=0) nếu thép chạm các biên này
-    CHỈ snap về 2 biên này, không snap về R_in và R_out
-    
-    Parameters:
-    - x, y: Tọa độ điểm (mm)
-    - snap_tolerance: Khoảng cách tối đa để coi là "chạm" boundary (mm)
-                      Tăng lên 0.5mm để bắt được nhiều điểm hơn
-    
-    Returns:
-    - (x_snapped, y_snapped): Tọa độ sau khi snap (nếu chạm boundary)
-    """
-    x_snapped = x
-    y_snapped = y
-    
-    # Kiểm tra xem điểm có chạm 2 biên đặc biệt không
-    # Snap về trục X (y = 0) - chỉ trong góc phần tư đầu
-    snap_to_x_axis = abs(y) <= snap_tolerance and x >= -snap_tolerance
-    # Snap về trục Y (x = 0) - chỉ trong góc phần tư đầu
-    snap_to_y_axis = abs(x) <= snap_tolerance and y >= -snap_tolerance
-    
-    # Nếu không chạm 2 biên này, trả về tọa độ gốc
-    if not (snap_to_x_axis or snap_to_y_axis):
-        return (x_snapped, y_snapped)
-    
-    # Xử lý snap về trục X (y = 0)
-    if snap_to_x_axis:
-        y_snapped = 0.0
-        if x < 0:
-            x_snapped = 0.0
-        # Giữ nguyên x, đảm bảo >= 0
-        x_snapped = max(0.0, x)
-        return (x_snapped, y_snapped)
-    
-    # Xử lý snap về trục Y (x = 0)
-    if snap_to_y_axis:
-        x_snapped = 0.0
-        if y < 0:
-            y_snapped = 0.0
-        # Giữ nguyên y, đảm bảo >= 0
-        y_snapped = max(0.0, y)
-        return (x_snapped, y_snapped)
-    
-    return (x_snapped, y_snapped)
-
-def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace, tolerance=0.8):
-    """
-    Hàm trích xuất đường bao của một giá trị cụ thể trong ma trận và vẽ vào DXF
-    Sử dụng approximate_polygon để làm mịn - phương pháp đơn giản như GEmi.py
-    KHÔNG dùng spline để tránh răng cưa và biến dạng
-    
-    Parameters:
-    - tolerance: Độ tolerance cho approximate_polygon (0.8 = mặc định, làm mịn tốt)
-                 tolerance=0.8 giúp giảm số điểm thừa, làm đường thẳng mượt hơn
-    """
-    # Tạo mask nhị phân
-    binary_mask = (matrix == value_to_extract).astype(float)
-    
-    # Tìm đường bao (contours) với subpixel accuracy
+def export_magnet_contours(matrix, pixel_size_x, pixel_size_y, msp, layer_name, tolerance=0.8):
+    """Export nam châm bằng find_contours (giữ nguyên)"""
+    binary_mask = (matrix == 2).astype(float)
     contours = measure.find_contours(binary_mask, level=0.5)
     
     count = 0
     for contour in contours:
-        # --- LÀM TRƠN ĐƯỜNG BAO BẰNG approximate_polygon ---
-        # Phương pháp Douglas-Peucker: giảm số điểm thừa, làm đường thẳng mượt hơn
-        # tolerance=0.8 giúp giảm răng cưa hiệu quả (như GEmi.py)
-        simplified_contour = approximate_polygon(contour, tolerance=tolerance)
+        simplified = approximate_polygon(contour, tolerance=tolerance)
+        points = [(p[1] * pixel_size_x, p[0] * pixel_size_y) for p in simplified]
         
-        # Chuyển đổi sang tọa độ thực (mm)
-        real_points = []
-        for p in simplified_contour:
-            r, c = p[0], p[1]
-            real_x = c * pixel_size_x
-            real_y = r * pixel_size_y
-            
-            # FIX: Snap về 2 biên đặc biệt (x=0 và y=0) cho IRON khi thép chạm biên
-            # Điều này giúp thép bám sát boundary, tránh lỗi boundary matching trong Ansys
-            if layer_name == "IRON":
-                real_x, real_y = snap_to_axis_boundary(real_x, real_y, snap_tolerance=0.5)
-            
-            real_points.append((real_x, real_y))
-        
-        # Lọc bỏ các vụn quá nhỏ (nhiễu)
-        if len(real_points) > 3:
-            # Dùng LWPOLYLINE đơn giản, KHÔNG dùng spline để tránh răng cưa
-            dxf_modelspace.add_lwpolyline(real_points, close=True, 
-                                          dxfattribs={'layer': layer_name})
+        if len(points) > 3:
+            msp.add_lwpolyline(points, close=True, dxfattribs={'layer': layer_name})
             count += 1
+    
     return count
 
-# Khởi tạo file DXF
+# ==========================================
+# XUẤT DXF
+# ==========================================
 doc = ezdxf.new()
 msp = doc.modelspace()
+doc.layers.add(name="MAGNET", color=1)
+doc.layers.add(name="AIR_HOLE", color=4)
 
-# Tạo các Layer để quản lý màu sắc
-doc.layers.add(name="MAGNET", color=1)   # Màu đỏ (Red)
-doc.layers.add(name="AIR_HOLE", color=4) # Màu xanh (Cyan)
-doc.layers.add(name="IRON", color=7)     # Màu trắng/xám cho sắt
+num_mags = export_magnet_contours(magnet_design, pixel_size_x, pixel_size_y, msp, "MAGNET")
+num_holes, air_contours = export_air_holes_pixel_trace(final_design, GX, GY, pixel_size_x, pixel_size_y, 
+                                                        msp, "AIR_HOLE", downsample_step=5)
 
-# --- XUẤT VÙNG SẮT (Giá trị 1) ---
-# QUAN TRỌNG: Loại bỏ phần sắt bị che bởi nam châm VÀ air holes
-# Tạo matrix riêng cho sắt, loại bỏ phần nam châm VÀ air holes
-# IRON phải là một khối ĐẶC, không có lỗ
-iron_design = final_design.copy()
-iron_design[iron_design == 2] = -1  # Loại bỏ nam châm khỏi matrix sắt
-iron_design[iron_design == 0] = -1  # QUAN TRỌNG: Loại bỏ air holes khỏi matrix sắt
-# Kết quả: iron_design chỉ có value=1 (sắt đặc), không có lỗ
-
-# Dùng tolerance=0.8 như GEmi.py để làm mịn tốt, giảm răng cưa
-num_iron = export_contours_to_dxf(iron_design, 1, "IRON", msp, tolerance=0.8)
-
-# --- XUẤT NAM CHÂM (Giá trị 2) ---
-# Dùng tolerance=0.8 như GEmi.py để làm mịn tốt, giảm răng cưa
-num_mags = export_contours_to_dxf(final_design, 2, "MAGNET", msp, tolerance=0.8)
-
-# --- XUẤT LỖ KHÍ (Giá trị 0) ---
-# Xuất air holes ra DXF để Ansys có thể boolean subtract từ sắt
-num_holes = export_contours_to_dxf(final_design, 0, "AIR_HOLE", msp, tolerance=0.8)
-
-# Lưu file
 filename = "rotor_design.dxf"
 doc.saveas(filename)
-
-print(f"--- KẾT QUẢ ---")
-print(f"Đã xuất file '{filename}' thành công!")
-print(f"Số lượng vùng sắt: {num_iron}")
-print(f"Số lượng nam châm: {num_mags}")
-print(f"Số lượng lỗ khí: {num_holes}")
-print(f"Lưu ý: Dùng phương pháp đơn giản như GEmi.py (approximate_polygon, tolerance=0.8)")
-print(f"      IRON đã loại bỏ air và magnet, là khối đặc")
-print(f"      Trong Ansys, import cả 3 layer: IRON, MAGNET, AIR_HOLE")
+print(f"\nFile: {filename} | Nam châm: {num_mags} | Lỗ khí: {num_holes}")
 
 # ==========================================
-# PHẦN 3: KIỂM TRA (VẼ LẠI DXF LÊN MÀN HÌNH)
+# VISUALIZATION
 # ==========================================
-plt.figure(figsize=(10, 5))
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-# Hình 1: Ma trận gốc (Pixel)
-plt.subplot(1, 2, 1)
+ax1 = axes[0]
 cmap = ListedColormap(['white', 'cyan', 'gray', 'red'])
-plt.title("Ma trận Pixel (Gốc)")
-plt.pcolormesh(GX, GY, final_design, cmap=cmap, vmin=-1, vmax=2, shading='auto')
-plt.axis('equal')
+# Tạo design để hiển thị (có cả nam châm)
+display_design = final_design.copy()
+display_design[mask_magnet] = 2  # Thêm nam châm vào để hiển thị
+ax1.pcolormesh(GX, GY, display_design, cmap=cmap, vmin=-1, vmax=2, shading='auto')
+ax1.set_title("Ma trận Pixel (Nam châm nằm trong lỗ)")
+ax1.plot([0, R_out], [0, R_out], 'g--', lw=2)
+ax1.set_aspect('equal')
 
-# Hình 2: Đường bao Vector (Cái sẽ vào Ansys)
-plt.subplot(1, 2, 2)
-plt.title("Đường bao Vector (Sẽ xuất DXF)")
-# Vẽ lại nền rotor cho dễ nhìn
-plt.plot([0, R_out], [0, 0], 'k--', alpha=0.3)
-plt.plot([0, R_out*np.cos(np.pi/2)], [0, R_out*np.sin(np.pi/2)], 'k--', alpha=0.3)
+ax2 = axes[1]
+ax2.set_title("Contours (Pixel trace - răng cưa)")
 
-# Vẽ lại các contour tìm được (đã được làm mịn bằng approximate_polygon)
-# FIX: Dùng tolerance=0.8 giống như khi export để đảm bảo khớp nhau (như GEmi.py)
-for val, color in zip([1, 2, 0], ['gray', 'red', 'cyan']):
-    if val == 1:
-        # Vẽ sắt từ iron_design (đã loại bỏ air và magnet)
-        binary_mask = (iron_design == val).astype(float)
-    else:
-        # Vẽ nam châm và air từ final_design
-        binary_mask = (final_design == val).astype(float)
-    
-    contours = measure.find_contours(binary_mask, level=0.5)
-    
-    for i, contour in enumerate(contours):
-        # Làm trơn bằng approximate_polygon với tolerance=0.8 (như GEmi.py)
-        simplified_contour = approximate_polygon(contour, tolerance=0.8)
-        
-        # Chuyển đổi sang tọa độ thực và vẽ
-        label = None
-        if i == 0:
-            if val == 1:
-                label = 'IRON'
-            elif val == 2:
-                label = 'MAGNET'
-            else:
-                label = 'AIR_HOLE'
-        
-        plt.plot(simplified_contour[:, 1] * pixel_size_x, 
-                simplified_contour[:, 0] * pixel_size_y, 
-                color=color, linewidth=2, alpha=0.8, label=label)
+# Biên rotor
+theta_arc = np.linspace(0, np.pi/2, 100)
+ax2.plot(R_out * np.cos(theta_arc), R_out * np.sin(theta_arc), 'k-', lw=1)
+ax2.plot(R_in * np.cos(theta_arc), R_in * np.sin(theta_arc), 'k-', lw=1)
+ax2.plot([R_in, R_out], [0, 0], 'k-', lw=1)
+ax2.plot([0, 0], [R_in, R_out], 'k-', lw=1)
 
-plt.axis('equal')
-plt.grid(True, alpha=0.3)
+# Air holes từ pixel trace
+for contour in air_contours:
+    contour_ds = downsample_contour(contour, step=5)
+    xs = [c[1] * pixel_size_x for c in contour_ds] + [contour_ds[0][1] * pixel_size_x]
+    ys = [c[0] * pixel_size_y for c in contour_ds] + [contour_ds[0][0] * pixel_size_y]
+    ax2.plot(xs, ys, 'b-', lw=1)
 
-# Tự động lưu ảnh sau mỗi lần chạy (ghi đè file cũ)
-image_filename = "rotor_design.png"
-plt.savefig(image_filename, dpi=300, bbox_inches='tight')
-print(f"Đã lưu ảnh: '{image_filename}'")
+# Magnet - dùng magnet_design
+mag_contours = measure.find_contours((magnet_design == 2).astype(float), level=0.5)
+for c in mag_contours:
+    ax2.plot(c[:, 1] * pixel_size_x, c[:, 0] * pixel_size_y, 'r-', lw=1.5)
 
+ax2.set_aspect('equal')
+ax2.set_xlim(-2, R_out + 2)
+ax2.set_ylim(-2, R_out + 2)
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("rotor_design.png", dpi=200)
+print(f"Đã lưu: rotor_design.png")
 plt.show()
