@@ -150,11 +150,24 @@ phi_value = ngnet_generate_shape(weights, centers, GX, GY, sigma=4.0)
 
 # --- TỔNG HỢP ---
 # 0: Khí, 1: Sắt, 2: Nam châm
+# QUAN TRỌNG: Thứ tự gán giá trị phải đúng để nam châm không bị cắt bởi sắt
+# Nam châm chỉ bị cắt bởi bán kính giới hạn (R_in, R_out), không bị cắt bởi sắt
+
 final_design = np.full_like(GX, -1) # -1 là nền
-final_design[mask_rotor_region] = 1 # Sắt
-flux_barrier_mask = (phi_value < 0) & mask_rotor_region
-final_design[flux_barrier_mask] = 0 # Khí
-final_design[mask_magnet] = 2       # Nam châm
+
+# BƯỚC 1: Gán nam châm TRƯỚC (ưu tiên cao nhất)
+# Nam châm có thể bị cắt bởi bán kính giới hạn (mask_rotor_region đã xử lý điều này)
+# Nhưng nam châm KHÔNG bị cắt bởi sắt hay flux barrier
+final_design[mask_magnet] = 2  # Nam châm
+
+# BƯỚC 2: Gán flux barrier (không khí) - nhưng KHÔNG ghi đè lên nam châm
+flux_barrier_mask = (phi_value < 0) & mask_rotor_region & (final_design != 2)
+final_design[flux_barrier_mask] = 0  # Khí (chỉ ở vùng không phải nam châm)
+
+# BƯỚC 3: Gán sắt - nhưng KHÔNG ghi đè lên nam châm và flux barrier
+# Sắt chỉ được gán ở vùng rotor, trừ vùng nam châm và flux barrier
+iron_mask = mask_rotor_region & (final_design == -1)
+final_design[iron_mask] = 1  # Sắt (chỉ ở vùng không phải nam châm và không phải flux barrier)
 
 # ==========================================
 # PHẦN 2: XUẤT DXF (QUAN TRỌNG)
@@ -315,8 +328,11 @@ def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace,
     
     Parameters:
     - use_spline: Nếu True, xuất ra SPLINE thay vì LWPOLYLINE (tốt cho Ansys Maxwell)
-    - tolerance: Độ tolerance cho approximate_polygon (0.5-1.5 khuyến nghị, 0.8 = mặc định)
-                 Càng lớn càng mịn nhưng có thể mất chi tiết
+                  LƯU Ý: KHÔNG nên dùng spline cho hình chữ nhật (nam châm) vì sẽ làm biến dạng
+    - tolerance: Độ tolerance cho approximate_polygon 
+                 - Hình chữ nhật (nam châm): dùng 0.2-0.3 để giữ góc vuông
+                 - Đường cong (lỗ khí): dùng 0.5-1.5 để làm mịn
+                 Càng lớn càng mịn nhưng có thể mất chi tiết và dịch chuyển vị trí
     """
     # Tạo mask nhị phân
     binary_mask = (matrix == value_to_extract).astype(float)
@@ -365,18 +381,35 @@ doc = ezdxf.new()
 msp = doc.modelspace()
 
 # Tạo các Layer để quản lý màu sắc
+# Lưu ý: KHÔNG tạo layer AIR_HOLE vì vùng không khí không được xuất ra DXF
 doc.layers.add(name="MAGNET", color=1)   # Màu đỏ (Red)
-doc.layers.add(name="AIR_HOLE", color=4) # Màu xanh (Cyan)
+# doc.layers.add(name="AIR_HOLE", color=4) # KHÔNG dùng - vùng air không được xuất
 
-# --- XUẤT NAM CHÂM (Giá trị 2) ---
-# tolerance: 0.8 = mặc định (cân bằng), có thể điều chỉnh 0.5-1.5
-# use_spline: True = dùng SPLINE (tốt cho Ansys Maxwell), False = dùng polyline
-num_mags = export_contours_to_dxf(final_design, 2, "MAGNET", msp, 
+# --- XUẤT VÙNG SẮT (Giá trị 1) ---
+# FIX: Xuất vùng sắt với các lỗ khí bên trong được xử lý đúng cách
+# QUAN TRỌNG: Loại bỏ phần sắt bị che bởi nam châm (nam châm cắt sắt, không phải ngược lại)
+# Tạo matrix riêng cho sắt, loại bỏ phần nam châm
+iron_design = final_design.copy()
+iron_design[iron_design == 2] = -1  # Loại bỏ nam châm khỏi matrix sắt
+
+doc.layers.add(name="IRON", color=7)  # Màu trắng/xám cho sắt
+num_iron = export_contours_to_dxf(iron_design, 1, "IRON", msp,
                                    use_spline=True, tolerance=0.8)
 
-# --- XUẤT LỖ KHÍ (Giá trị 0) ---
-num_holes = export_contours_to_dxf(final_design, 0, "AIR_HOLE", msp,
-                                    use_spline=True, tolerance=0.8)
+# --- XUẤT NAM CHÂM (Giá trị 2) ---
+# FIX: tolerance nhỏ hơn (0.2-0.3) để giữ góc vuông của hình chữ nhật
+# FIX: KHÔNG dùng spline cho nam châm vì spline làm biến dạng hình chữ nhật
+# Dùng polyline để giữ nguyên hình dạng chữ nhật
+num_mags = export_contours_to_dxf(final_design, 2, "MAGNET", msp, 
+                                   use_spline=False, tolerance=0.25)
+
+# --- KHÔNG XUẤT LỖ KHÍ (Giá trị 0) ---
+# FIX: Vùng không khí (value=0) KHÔNG được xuất ra DXF như một vật thể riêng
+# Các lỗ khí sẽ tự động được xử lý như lỗ rỗng bên trong vùng sắt
+# khi Ansys import và thực hiện boolean operations
+# num_holes = export_contours_to_dxf(final_design, 0, "AIR_HOLE", msp,
+#                                     use_spline=True, tolerance=0.8)
+num_holes = 0  # Không xuất vùng air
 
 # Lưu file
 filename = "rotor_design.dxf"
@@ -384,8 +417,10 @@ doc.saveas(filename)
 
 print(f"--- KẾT QUẢ ---")
 print(f"Đã xuất file '{filename}' thành công!")
+print(f"Số lượng vùng sắt: {num_iron}")
 print(f"Số lượng nam châm: {num_mags}")
-print(f"Số lượng lỗ khí NGnet: {num_holes}")
+print(f"Lưu ý: Vùng không khí (air) KHÔNG được xuất ra DXF để tránh lỗi cắt vật thể")
+print(f"      Các lỗ khí sẽ được xử lý như lỗ rỗng bên trong vùng sắt khi import vào Ansys")
 
 # ==========================================
 # PHẦN 3: KIỂM TRA (VẼ LẠI DXF LÊN MÀN HÌNH)
@@ -407,13 +442,17 @@ plt.plot([0, R_out], [0, 0], 'k--', alpha=0.3)
 plt.plot([0, R_out*np.cos(np.pi/2)], [0, R_out*np.sin(np.pi/2)], 'k--', alpha=0.3)
 
 # Vẽ lại các contour tìm được (đã được làm mịn bằng approximate_polygon)
-for val, color in zip([2, 0], ['red', 'blue']):
+# FIX: Dùng tolerance giống như khi export để đảm bảo khớp nhau
+# FIX: Chỉ vẽ vùng sắt (1) và nam châm (2), KHÔNG vẽ vùng air (0)
+for val, color, tol in zip([1, 2], ['gray', 'red'], [0.8, 0.25]):
     binary_mask = (final_design == val).astype(float)
     contours = measure.find_contours(binary_mask, level=0.5)
     
     for contour in contours:
-        # Làm trơn bằng approximate_polygon giống như trong export
-        simplified_contour = approximate_polygon(contour, tolerance=0.8)
+        # Làm trơn bằng approximate_polygon với tolerance tương ứng
+        # Vùng sắt (val=1): tolerance=0.8 để làm mịn đường cong
+        # Nam châm (val=2): tolerance=0.25 để giữ góc vuông
+        simplified_contour = approximate_polygon(contour, tolerance=tol)
         
         # Chuyển đổi sang tọa độ thực và vẽ
         plt.plot(simplified_contour[:, 1] * pixel_size_x, 
