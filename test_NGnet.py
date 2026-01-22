@@ -320,19 +320,61 @@ def smooth_contour(contour_points, smoothing_factor=2.0, num_points=None, method
     # Khuyến nghị: dùng 'bspline' thay vì 'advanced'
     return smooth_contour_simple(contour_points, num_points)
 
-def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace, 
-                           use_spline=False, tolerance=0.8):
+def snap_to_axis_boundary(x, y, snap_tolerance=0.5):
     """
-    Hàm trích xuất đường bao của một giá trị cụ thể trong ma trận và vẽ vào DXF
-    Sử dụng approximate_polygon để làm mịn - phương pháp đơn giản và hiệu quả
+    Snap điểm về 2 biên đặc biệt (x=0 và y=0) nếu thép chạm các biên này
+    CHỈ snap về 2 biên này, không snap về R_in và R_out
     
     Parameters:
-    - use_spline: Nếu True, xuất ra SPLINE thay vì LWPOLYLINE (tốt cho Ansys Maxwell)
-                  LƯU Ý: KHÔNG nên dùng spline cho hình chữ nhật (nam châm) vì sẽ làm biến dạng
-    - tolerance: Độ tolerance cho approximate_polygon 
-                 - Hình chữ nhật (nam châm): dùng 0.2-0.3 để giữ góc vuông
-                 - Đường cong (lỗ khí): dùng 0.5-1.5 để làm mịn
-                 Càng lớn càng mịn nhưng có thể mất chi tiết và dịch chuyển vị trí
+    - x, y: Tọa độ điểm (mm)
+    - snap_tolerance: Khoảng cách tối đa để coi là "chạm" boundary (mm)
+                      Tăng lên 0.5mm để bắt được nhiều điểm hơn
+    
+    Returns:
+    - (x_snapped, y_snapped): Tọa độ sau khi snap (nếu chạm boundary)
+    """
+    x_snapped = x
+    y_snapped = y
+    
+    # Kiểm tra xem điểm có chạm 2 biên đặc biệt không
+    # Snap về trục X (y = 0) - chỉ trong góc phần tư đầu
+    snap_to_x_axis = abs(y) <= snap_tolerance and x >= -snap_tolerance
+    # Snap về trục Y (x = 0) - chỉ trong góc phần tư đầu
+    snap_to_y_axis = abs(x) <= snap_tolerance and y >= -snap_tolerance
+    
+    # Nếu không chạm 2 biên này, trả về tọa độ gốc
+    if not (snap_to_x_axis or snap_to_y_axis):
+        return (x_snapped, y_snapped)
+    
+    # Xử lý snap về trục X (y = 0)
+    if snap_to_x_axis:
+        y_snapped = 0.0
+        if x < 0:
+            x_snapped = 0.0
+        # Giữ nguyên x, đảm bảo >= 0
+        x_snapped = max(0.0, x)
+        return (x_snapped, y_snapped)
+    
+    # Xử lý snap về trục Y (x = 0)
+    if snap_to_y_axis:
+        x_snapped = 0.0
+        if y < 0:
+            y_snapped = 0.0
+        # Giữ nguyên y, đảm bảo >= 0
+        y_snapped = max(0.0, y)
+        return (x_snapped, y_snapped)
+    
+    return (x_snapped, y_snapped)
+
+def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace, tolerance=0.8):
+    """
+    Hàm trích xuất đường bao của một giá trị cụ thể trong ma trận và vẽ vào DXF
+    Sử dụng approximate_polygon để làm mịn - phương pháp đơn giản như GEmi.py
+    KHÔNG dùng spline để tránh răng cưa và biến dạng
+    
+    Parameters:
+    - tolerance: Độ tolerance cho approximate_polygon (0.8 = mặc định, làm mịn tốt)
+                 tolerance=0.8 giúp giảm số điểm thừa, làm đường thẳng mượt hơn
     """
     # Tạo mask nhị phân
     binary_mask = (matrix == value_to_extract).astype(float)
@@ -344,7 +386,7 @@ def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace,
     for contour in contours:
         # --- LÀM TRƠN ĐƯỜNG BAO BẰNG approximate_polygon ---
         # Phương pháp Douglas-Peucker: giảm số điểm thừa, làm đường thẳng mượt hơn
-        # tolerance càng lớn càng mịn, nhưng có thể mất chi tiết nhỏ
+        # tolerance=0.8 giúp giảm răng cưa hiệu quả (như GEmi.py)
         simplified_contour = approximate_polygon(contour, tolerance=tolerance)
         
         # Chuyển đổi sang tọa độ thực (mm)
@@ -353,26 +395,19 @@ def export_contours_to_dxf(matrix, value_to_extract, layer_name, dxf_modelspace,
             r, c = p[0], p[1]
             real_x = c * pixel_size_x
             real_y = r * pixel_size_y
+            
+            # FIX: Snap về 2 biên đặc biệt (x=0 và y=0) cho IRON khi thép chạm biên
+            # Điều này giúp thép bám sát boundary, tránh lỗi boundary matching trong Ansys
+            if layer_name == "IRON":
+                real_x, real_y = snap_to_axis_boundary(real_x, real_y, snap_tolerance=0.5)
+            
             real_points.append((real_x, real_y))
         
         # Lọc bỏ các vụn quá nhỏ (nhiễu)
         if len(real_points) > 3:
-            if use_spline and len(real_points) >= 4:
-                # Xuất ra SPLINE (mịn hơn, tốt cho Ansys Maxwell)
-                try:
-                    dxf_modelspace.add_spline(
-                        control_points=real_points,
-                        degree=3,
-                        dxfattribs={'layer': layer_name}
-                    )
-                except:
-                    # Fallback về polyline nếu spline không được hỗ trợ
-                    dxf_modelspace.add_lwpolyline(real_points, close=True, 
-                                                  dxfattribs={'layer': layer_name})
-            else:
-                # Xuất ra LWPOLYLINE
-                dxf_modelspace.add_lwpolyline(real_points, close=True, 
-                                              dxfattribs={'layer': layer_name})
+            # Dùng LWPOLYLINE đơn giản, KHÔNG dùng spline để tránh răng cưa
+            dxf_modelspace.add_lwpolyline(real_points, close=True, 
+                                          dxfattribs={'layer': layer_name})
             count += 1
     return count
 
@@ -381,35 +416,29 @@ doc = ezdxf.new()
 msp = doc.modelspace()
 
 # Tạo các Layer để quản lý màu sắc
-# Lưu ý: KHÔNG tạo layer AIR_HOLE vì vùng không khí không được xuất ra DXF
 doc.layers.add(name="MAGNET", color=1)   # Màu đỏ (Red)
-# doc.layers.add(name="AIR_HOLE", color=4) # KHÔNG dùng - vùng air không được xuất
+doc.layers.add(name="AIR_HOLE", color=4) # Màu xanh (Cyan)
+doc.layers.add(name="IRON", color=7)     # Màu trắng/xám cho sắt
 
 # --- XUẤT VÙNG SẮT (Giá trị 1) ---
-# FIX: Xuất vùng sắt với các lỗ khí bên trong được xử lý đúng cách
-# QUAN TRỌNG: Loại bỏ phần sắt bị che bởi nam châm (nam châm cắt sắt, không phải ngược lại)
-# Tạo matrix riêng cho sắt, loại bỏ phần nam châm
+# QUAN TRỌNG: Loại bỏ phần sắt bị che bởi nam châm VÀ air holes
+# Tạo matrix riêng cho sắt, loại bỏ phần nam châm VÀ air holes
+# IRON phải là một khối ĐẶC, không có lỗ
 iron_design = final_design.copy()
 iron_design[iron_design == 2] = -1  # Loại bỏ nam châm khỏi matrix sắt
+iron_design[iron_design == 0] = -1  # QUAN TRỌNG: Loại bỏ air holes khỏi matrix sắt
+# Kết quả: iron_design chỉ có value=1 (sắt đặc), không có lỗ
 
-doc.layers.add(name="IRON", color=7)  # Màu trắng/xám cho sắt
-num_iron = export_contours_to_dxf(iron_design, 1, "IRON", msp,
-                                   use_spline=True, tolerance=0.8)
+# Dùng tolerance=0.8 như GEmi.py để làm mịn tốt, giảm răng cưa
+num_iron = export_contours_to_dxf(iron_design, 1, "IRON", msp, tolerance=0.8)
 
 # --- XUẤT NAM CHÂM (Giá trị 2) ---
-# FIX: tolerance nhỏ hơn (0.2-0.3) để giữ góc vuông của hình chữ nhật
-# FIX: KHÔNG dùng spline cho nam châm vì spline làm biến dạng hình chữ nhật
-# Dùng polyline để giữ nguyên hình dạng chữ nhật
-num_mags = export_contours_to_dxf(final_design, 2, "MAGNET", msp, 
-                                   use_spline=False, tolerance=0.25)
+# Dùng tolerance=0.8 như GEmi.py để làm mịn tốt, giảm răng cưa
+num_mags = export_contours_to_dxf(final_design, 2, "MAGNET", msp, tolerance=0.8)
 
-# --- KHÔNG XUẤT LỖ KHÍ (Giá trị 0) ---
-# FIX: Vùng không khí (value=0) KHÔNG được xuất ra DXF như một vật thể riêng
-# Các lỗ khí sẽ tự động được xử lý như lỗ rỗng bên trong vùng sắt
-# khi Ansys import và thực hiện boolean operations
-# num_holes = export_contours_to_dxf(final_design, 0, "AIR_HOLE", msp,
-#                                     use_spline=True, tolerance=0.8)
-num_holes = 0  # Không xuất vùng air
+# --- XUẤT LỖ KHÍ (Giá trị 0) ---
+# Xuất air holes ra DXF để Ansys có thể boolean subtract từ sắt
+num_holes = export_contours_to_dxf(final_design, 0, "AIR_HOLE", msp, tolerance=0.8)
 
 # Lưu file
 filename = "rotor_design.dxf"
@@ -419,8 +448,10 @@ print(f"--- KẾT QUẢ ---")
 print(f"Đã xuất file '{filename}' thành công!")
 print(f"Số lượng vùng sắt: {num_iron}")
 print(f"Số lượng nam châm: {num_mags}")
-print(f"Lưu ý: Vùng không khí (air) KHÔNG được xuất ra DXF để tránh lỗi cắt vật thể")
-print(f"      Các lỗ khí sẽ được xử lý như lỗ rỗng bên trong vùng sắt khi import vào Ansys")
+print(f"Số lượng lỗ khí: {num_holes}")
+print(f"Lưu ý: Dùng phương pháp đơn giản như GEmi.py (approximate_polygon, tolerance=0.8)")
+print(f"      IRON đã loại bỏ air và magnet, là khối đặc")
+print(f"      Trong Ansys, import cả 3 layer: IRON, MAGNET, AIR_HOLE")
 
 # ==========================================
 # PHẦN 3: KIỂM TRA (VẼ LẠI DXF LÊN MÀN HÌNH)
@@ -442,22 +473,34 @@ plt.plot([0, R_out], [0, 0], 'k--', alpha=0.3)
 plt.plot([0, R_out*np.cos(np.pi/2)], [0, R_out*np.sin(np.pi/2)], 'k--', alpha=0.3)
 
 # Vẽ lại các contour tìm được (đã được làm mịn bằng approximate_polygon)
-# FIX: Dùng tolerance giống như khi export để đảm bảo khớp nhau
-# FIX: Chỉ vẽ vùng sắt (1) và nam châm (2), KHÔNG vẽ vùng air (0)
-for val, color, tol in zip([1, 2], ['gray', 'red'], [0.8, 0.25]):
-    binary_mask = (final_design == val).astype(float)
+# FIX: Dùng tolerance=0.8 giống như khi export để đảm bảo khớp nhau (như GEmi.py)
+for val, color in zip([1, 2, 0], ['gray', 'red', 'cyan']):
+    if val == 1:
+        # Vẽ sắt từ iron_design (đã loại bỏ air và magnet)
+        binary_mask = (iron_design == val).astype(float)
+    else:
+        # Vẽ nam châm và air từ final_design
+        binary_mask = (final_design == val).astype(float)
+    
     contours = measure.find_contours(binary_mask, level=0.5)
     
-    for contour in contours:
-        # Làm trơn bằng approximate_polygon với tolerance tương ứng
-        # Vùng sắt (val=1): tolerance=0.8 để làm mịn đường cong
-        # Nam châm (val=2): tolerance=0.25 để giữ góc vuông
-        simplified_contour = approximate_polygon(contour, tolerance=tol)
+    for i, contour in enumerate(contours):
+        # Làm trơn bằng approximate_polygon với tolerance=0.8 (như GEmi.py)
+        simplified_contour = approximate_polygon(contour, tolerance=0.8)
         
         # Chuyển đổi sang tọa độ thực và vẽ
+        label = None
+        if i == 0:
+            if val == 1:
+                label = 'IRON'
+            elif val == 2:
+                label = 'MAGNET'
+            else:
+                label = 'AIR_HOLE'
+        
         plt.plot(simplified_contour[:, 1] * pixel_size_x, 
                 simplified_contour[:, 0] * pixel_size_y, 
-                color=color, linewidth=2, alpha=0.8)
+                color=color, linewidth=2, alpha=0.8, label=label)
 
 plt.axis('equal')
 plt.grid(True, alpha=0.3)
