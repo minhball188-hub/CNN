@@ -1,415 +1,393 @@
-"""
-Export riêng 2 file DXF:
-1. air_regions.dxf - Các vùng AIR
-2. iron_regions.dxf - Vùng IRON = Total - AIR
+# file: import_mesh_to_flux.py
+# Import lưới từ file .TRA vào FLUX và gán vật liệu
 
-Workflow trong Flux:
-1. Import air_regions.dxf → tạo faces AIR
-2. Import iron_regions.dxf → tạo faces IRON
-"""
+from flux_connector import FluxConnection
 
-import os
-import numpy as np
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from enum import Enum
-from shapely.geometry import Polygon, MultiPolygon
-from shapely.ops import unary_union
-import warnings
+# Tolerance để so sánh tọa độ (mm)
+COORD_TOLERANCE = 0.05  # Tăng lên 0.05mm để match tốt hơn
 
-warnings.filterwarnings('ignore')
+# Bán kính trong và ngoài của rotor (mm)
+R_IN = 16.0
+R_OUT = 39.0
+R_TOLERANCE = 0.1  # Tolerance để check điểm nằm trên đường tròn
 
-DXF_SCALE = 1000.0
+def is_on_rin(x, y):
+    """Check xem điểm (x,y) có nằm trên đường tròn Rin không"""
+    r_squared = x*x + y*y
+    rin_squared = R_IN * R_IN  # 256
+    return abs(r_squared - rin_squared) < R_TOLERANCE * R_IN * 2
 
+def is_on_rout(x, y):
+    """Check xem điểm (x,y) có nằm trên đường tròn Rout không"""
+    r_squared = x*x + y*y
+    rout_squared = R_OUT * R_OUT  # 1521
+    return abs(r_squared - rout_squared) < R_TOLERANCE * R_OUT * 2
 
-class Material(Enum):
-    IRON = 1
-    AIR = 0
+def is_on_boundary_circle(x, y):
+    """Check xem điểm có nằm trên Rin hoặc Rout không"""
+    return is_on_rin(x, y) or is_on_rout(x, y)
 
+# Số lượng points đã có trong project gốc (0 đến 146 = 147 points)
+# FLUX sẽ tự động gán ID mới bắt đầu từ 147
+EXISTING_POINT_COUNT = 147
 
-# ============================================================================
-# TRA Parsing
-# ============================================================================
-def _find_line_idx(lines: List[str], needle: str) -> int:
-    for i, s in enumerate(lines):
-        if needle in s:
-            return i
-    raise ValueError(f"Could not find: {needle!r}")
+# Các point biên đã có sẵn trong project gốc (hardcode vì FLUX không export được)
+# Format: {(x, y): point_id}
+BOUNDARY_POINTS = {
+    (0.0, 39.0): 7,
+    (11.62, 37.23): 6,      # (11.6229, 37.2278)
+    (27.58, 27.58): 10,     # (27.5772, 27.5772)
+    (37.23, 11.62): 33,     # (37.2278, 11.6229)
+    (39.0, 0.0): 34,
+    (0.0, 16.0): 24,
+    (11.31, 11.31): 5,      # (11.3137, 11.3137)
+    (16.0, 0.0): 23,
+    (7.51, 28.72): 4,       # (7.50806, 28.7213)
+    (20.24, 20.24): 9,      # (20.236, 20.236)
+    (30.84, 9.63): 2,       # (30.8426, 9.62938)
+    (9.63, 30.84): 1,       # (9.62938, 30.8426)
+    (18.11, 18.11): 8,      # (18.1147, 18.1147)
+    (28.72, 7.51): 3,       # (28.7213, 7.50806)
+}
 
+def normalize_coord(value):
+    """Normalize các giá trị rất nhỏ về 0"""
+    if abs(value) < COORD_TOLERANCE:
+        return 0.0
+    return value
 
-def parse_tra_nodes(path: str) -> Dict[int, Tuple[float, float]]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.read().splitlines()
-    coord_idx = _find_line_idx(lines, "Coordinates of the nodes")
-    nodes = {}
-    for s in lines[coord_idx + 1:]:
-        parts = s.split()
-        if len(parts) < 3:
+def find_matching_point(x, y, existing_coords, tolerance=COORD_TOLERANCE):
+    """Tìm point có tọa độ gần với (x, y) trong tolerance"""
+    for (ex, ey), point_id in existing_coords.items():
+        if abs(x - ex) < tolerance and abs(y - ey) < tolerance:
+            return point_id
+    return None
+
+def parse_tra_file(tra_path):
+    """Đọc file .TRA và trích xuất nodes và elements"""
+    nodes = {}  # {node_id: (x, y)}
+    elements = []  # [(n1, n2, n3), ...] - chỉ lấy 3 đỉnh của tam giác
+
+    with open(tra_path, 'r') as f:
+        lines = f.readlines()
+
+    # Tìm số nodes và elements
+    num_nodes = 0
+    num_elements = 0
+    for line in lines:
+        if 'Number of nodes' in line:
+            num_nodes = int(line.split()[0])
+        if 'Number of surface elements' in line:
+            num_elements = int(line.split()[0])
+
+    print(f"Số nodes: {num_nodes}")
+    print(f"Số elements: {num_elements}")
+
+    # Tìm vị trí bắt đầu của tọa độ nodes
+    node_start = 0
+    for i, line in enumerate(lines):
+        if 'Coordinates of the nodes' in line:
+            node_start = i + 1
             break
-        try:
-            nid = int(parts[0])
-            x = float(parts[1].replace("D", "E"))
-            y = float(parts[2].replace("D", "E"))
-            nodes[nid] = (x, y)
-        except ValueError:
+
+    # Đọc tọa độ nodes
+    for i in range(node_start, node_start + num_nodes):
+        parts = lines[i].split()
+        node_id = int(parts[0])
+        x = float(parts[1])
+        y = float(parts[2])
+        # Chuyển từ m sang mm và giữ 2 chữ số thập phân
+        x_mm = round(x * 1000, 2)
+        y_mm = round(y * 1000, 2)
+        # Normalize các giá trị rất nhỏ về 0
+        x_mm = normalize_coord(x_mm)
+        y_mm = normalize_coord(y_mm)
+        nodes[node_id] = (x_mm, y_mm)
+
+    # Tìm vị trí bắt đầu của elements
+    elem_start = 0
+    for i, line in enumerate(lines):
+        if 'Description of elements' in line:
+            elem_start = i + 1
             break
-    return nodes
+
+    # Đọc elements (mỗi element có 2 dòng: header và node indices)
+    for i in range(num_elements):
+        idx = elem_start + i * 2 + 1  # Dòng chứa node indices
+        parts = lines[idx].split()
+        # 6-node triangle: lấy 3 đỉnh đầu (corner nodes)
+        n1, n2, n3 = int(parts[0]), int(parts[1]), int(parts[2])
+        elements.append((n1, n2, n3))
+
+    return nodes, elements
 
 
-@dataclass
-class Tri6Element:
-    eid: int
-    region: int
-    n1: int
-    n2: int
-    n3: int
-    n4: int
-    n5: int
-    n6: int
-    material: Material = Material.IRON
+def main():
+    tra_path = r"D:\Minh Tuan\Projects\VS Code\CNN_test\Day 3\rotor_3.TRA"
+    flu_path = r"D:/Minh Tuan/Projects/VS Code/CNN_test/Day 3/IPM_mesh.FLU"
+    output_path = r"D:/Minh Tuan/Projects/VS Code/CNN_test/Day 3/IPM_mesh_with_rotor.FLU"
+    log_path = r"D:\Minh Tuan\Projects\VS Code\CNN_test\Day 3\import_log.txt"
 
-    @property
-    def corner_nodes(self):
-        return [self.n1, self.n2, self.n3]
+    # Mở file log
+    log = open(log_path, 'w', encoding='utf-8')
+    def log_print(msg):
+        print(msg)
+        log.write(msg + '\n')
+        log.flush()
 
+    log_print("--- BẮT ĐẦU IMPORT LƯỚI VÀO FLUX ---")
 
-def parse_tra_elements(path: str) -> List[Tri6Element]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        lines = f.read().splitlines()
-    eidx = _find_line_idx(lines, "Description of elements")
-    cidx = _find_line_idx(lines, "Coordinates of the nodes")
-    elements = []
-    i = eidx + 1
-    while i < cidx:
-        s = lines[i].strip()
-        if not s:
-            i += 1
-            continue
-        parts = s.split()
-        if len(parts) >= 3:
+    # Parse file TRA
+    log_print("Đang đọc file TRA...")
+    nodes, elements = parse_tra_file(tra_path)
+    log_print(f"Đã đọc {len(nodes)} nodes và {len(elements)} elements")
+
+    # In ra vài node đầu để kiểm tra
+    log_print("\n--- Kiểm tra 5 nodes đầu tiên ---")
+    for i, node_id in enumerate(sorted(nodes.keys())[:5]):
+        x, y = nodes[node_id]
+        log_print(f"  Node {node_id}: ({x}, {y}) mm")
+
+    # In ra vài element đầu để kiểm tra
+    log_print("\n--- Kiểm tra 5 elements đầu tiên ---")
+    for i, (n1, n2, n3) in enumerate(elements[:5]):
+        log_print(f"  Element {i+1}: nodes ({n1}, {n2}, {n3})")
+
+    # Face bắt đầu từ đâu (Point ID sẽ được tự động xác định)
+    START_FACE_ID = 46
+
+    try:
+        with FluxConnection() as flux:
+            flux.start(mode='FLUX2D')
+
+            # Load project
+            log_print(f"\n>>> Đang load project: {flu_path}")
+            flux.run_command(f'loadProject("{flu_path}")')
+            log_print(">>> Load xong!")
+
+            # Query các point hiện có trong project
+            log_print("\n>>> Đang đọc các point hiện có trong project...")
+            existing_points_file = r"D:/Minh Tuan/Projects/VS Code/CNN_test/Day 3/existing_points.txt"
+
+            # Dùng 1 lệnh duy nhất - list comprehension + join
+            flux.run_command(f"open('{existing_points_file}', 'w').write('\\n'.join([str(p.id) + ' ' + str(round(p.coordinate[0], 2)) + ' ' + str(round(p.coordinate[1], 2)) for p in Point.getAll()]))")
+
+            # Đọc file và tạo dict existing_coords
+            existing_coords = {}  # {(x, y): point_id} - các point đã có trong project
+            import time
+            time.sleep(0.5)  # Đợi file được ghi xong
             try:
-                eid, nper, region = int(parts[0]), int(parts[1]), int(parts[2])
-            except ValueError:
-                i += 1
-                continue
-            if nper == 6 and i + 1 < cidx:
-                conn = lines[i + 1].split()
-                if len(conn) >= 6:
-                    n1, n2, n3, n4, n5, n6 = [int(conn[j]) for j in range(6)]
-                    elements.append(Tri6Element(eid=eid, region=region,
-                                                n1=n1, n2=n2, n3=n3, n4=n4, n5=n5, n6=n6))
-                i += 2
-                continue
-        i += 1
-    return elements
+                with open(existing_points_file, 'r') as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            point_id = int(parts[0])
+                            x = normalize_coord(float(parts[1]))
+                            y = normalize_coord(float(parts[2]))
+                            existing_coords[(x, y)] = point_id
+                log_print(f"    Đã đọc {len(existing_coords)} points từ FLUX")
+            except Exception as e:
+                log_print(f"    Lỗi đọc existing points: {e}")
 
+            # Merge BOUNDARY_POINTS vào existing_coords (ưu tiên BOUNDARY_POINTS)
+            log_print(f"    Thêm {len(BOUNDARY_POINTS)} boundary points từ hardcode")
+            for coord, point_id in BOUNDARY_POINTS.items():
+                existing_coords[coord] = point_id
+            log_print(f"    Tổng cộng: {len(existing_coords)} points đã biết")
 
-# ============================================================================
-# NGnet
-# ============================================================================
-@dataclass
-class NGnetConfig:
-    r_min: float
-    r_max: float
-    theta_min: float
-    theta_max: float
-    n_radial: int = 6
-    n_angular: int = 5
+            # Log các boundary points
+            log_print("\n--- Boundary points (hardcode) ---")
+            for (x, y), pid in BOUNDARY_POINTS.items():
+                log_print(f"    Point[{pid}]: ({x}, {y})")
 
+            # FLUX sẽ tự động gán ID mới bắt đầu từ EXISTING_POINT_COUNT
+            # Project gốc có points 0-146, nên point mới sẽ là 147, 148, ...
+            current_point_id = EXISTING_POINT_COUNT
+            log_print(f"    Project gốc có {EXISTING_POINT_COUNT} points (0-{EXISTING_POINT_COUNT-1})")
+            log_print(f"    FLUX sẽ tạo point mới bắt đầu từ Point[{current_point_id}]")
 
-class NGnet:
-    def __init__(self, config: NGnetConfig):
-        self.config = config
-        self.centers = []
-        self.weights = None
-        cfg = config
-        r_vals = np.linspace(cfg.r_min, cfg.r_max, cfg.n_radial)
-        t_vals = np.linspace(cfg.theta_min, cfg.theta_max, cfg.n_angular)
-        dr = (cfg.r_max - cfg.r_min) / max(cfg.n_radial - 1, 1)
-        self.sigma = dr * 0.5
-        for r in r_vals:
-            for t in t_vals:
-                self.centers.append((r * np.cos(t), r * np.sin(t)))
-        self.weights = np.zeros(len(self.centers))
-        print(f"NGnet: {len(self.centers)} centers")
+            # Tạo mapping unique points
+            unique_coords = dict(existing_coords)  # Bắt đầu với các point đã có
+            node_to_point = {}  # {old_node_id: new_point_id}
+            duplicate_count = 0
+            existing_reuse_count = 0
 
-    def set_random_weights(self, seed=None):
-        if seed is not None:
-            np.random.seed(seed)
-        self.weights = np.random.uniform(-1, 1, len(self.centers))
+            log_print(f"\n>>> Đang tạo {len(nodes)} điểm...")
 
-    def phi(self, x, y):
-        g = [np.exp(-((x-cx)**2 + (y-cy)**2) / (2*self.sigma**2)) for cx, cy in self.centers]
-        s = sum(g)
-        if s < 1e-12:
-            return 0
-        return sum(w * gi / s for w, gi in zip(self.weights, g))
+            # DEBUG: In ra 15 node đầu tiên để verify
+            log_print("\n--- DEBUG: 15 nodes đầu tiên từ TRA file ---")
+            for node_id in sorted(nodes.keys())[:15]:
+                x, y = nodes[node_id]
+                log_print(f"    Node {node_id}: ({x}, {y})")
 
-    def get_material(self, x, y):
-        return Material.IRON if self.phi(x, y) >= 0 else Material.AIR
+            new_points_created = 0
+            for node_id in sorted(nodes.keys()):
+                x, y = nodes[node_id]
+                coord_key = (x, y)
 
-    def is_in_design_region(self, x, y):
-        cfg = self.config
-        r = np.sqrt(x**2 + y**2)
-        t = np.arctan2(y, x)
-        if t < 0:
-            t += 2 * np.pi
-        return cfg.r_min <= r <= cfg.r_max and cfg.theta_min <= t <= cfg.theta_max
+                # Bước 1: Check exact match trong unique_coords
+                if coord_key in unique_coords:
+                    existing_point = unique_coords[coord_key]
+                    node_to_point[node_id] = existing_point
 
+                    if coord_key in existing_coords:
+                        existing_reuse_count += 1
+                        if existing_reuse_count <= 20:
+                            log_print(f"    REUSE (exact): Node {node_id} ({x}, {y}) -> Point[{existing_point}]")
+                    else:
+                        duplicate_count += 1
+                        if duplicate_count <= 20:
+                            log_print(f"    DUPLICATE (TRA): Node {node_id} ({x}, {y}) -> Point[{existing_point}]")
+                else:
+                    # Bước 2: Check tolerance-based match trong existing_coords (project gốc)
+                    matched_point = find_matching_point(x, y, existing_coords)
 
-def assign_materials(elements, nodes, ngnet):
-    for e in elements:
-        cx = sum(nodes[n][0] for n in e.corner_nodes) / 3
-        cy = sum(nodes[n][1] for n in e.corner_nodes) / 3
-        if ngnet.is_in_design_region(cx, cy):
-            e.material = ngnet.get_material(cx, cy)
+                    if matched_point is not None:
+                        # Tìm thấy point gần trong project gốc
+                        node_to_point[node_id] = matched_point
+                        unique_coords[coord_key] = matched_point  # Cache để các node sau có thể dùng
+                        existing_reuse_count += 1
+                        if existing_reuse_count <= 20:
+                            log_print(f"    REUSE (tolerance): Node {node_id} ({x}, {y}) -> Point[{matched_point}]")
+                    else:
+                        # Bước 3: Check tolerance-based match trong unique_coords (TRA đã tạo)
+                        matched_new = find_matching_point(x, y, unique_coords)
+
+                        if matched_new is not None:
+                            node_to_point[node_id] = matched_new
+                            duplicate_count += 1
+                            if duplicate_count <= 20:
+                                log_print(f"    DUPLICATE (tolerance): Node {node_id} ({x}, {y}) -> Point[{matched_new}]")
+                        else:
+                            # Tạo điểm mới
+                            cmd = f"PointCoordinates(coordSys=CoordSys['XY1'], uvw=['{x}', '{y}'], nature=Nature['STANDARD'])"
+                            flux.run_command(cmd)
+
+                            # DEBUG: Log 15 points đầu tiên
+                            if new_points_created < 15:
+                                log_print(f"    TẠO: Node {node_id} ({x}, {y}) -> Point[{current_point_id}]")
+
+                            unique_coords[coord_key] = current_point_id
+                            node_to_point[node_id] = current_point_id
+                            current_point_id += 1
+                            new_points_created += 1
+
+            log_print(f">>> Đã tạo {new_points_created} điểm mới")
+            log_print(f">>> Dùng lại {existing_reuse_count} điểm từ project gốc")
+            log_print(f">>> Bỏ qua {duplicate_count} điểm trùng trong TRA")
+            log_print(f">>> Points mới từ {EXISTING_POINT_COUNT} đến {current_point_id - 1}")
+
+            # Tạo dict lưu tọa độ của mỗi point để check boundary
+            point_coords = {}  # {point_id: (x, y)}
+            for node_id, (x, y) in nodes.items():
+                point_id = node_to_point[node_id]
+                point_coords[point_id] = (x, y)
+
+            # DEBUG: Log các điểm nằm trên Rin và Rout
+            log_print("\n--- DEBUG: Các điểm nằm trên Rin (R=16mm) ---")
+            rin_points = [(pid, x, y) for pid, (x, y) in point_coords.items() if is_on_rin(x, y)]
+            for pid, x, y in rin_points[:10]:
+                log_print(f"    Point[{pid}]: ({x}, {y}) - R²={x*x+y*y:.2f}")
+            if len(rin_points) > 10:
+                log_print(f"    ... và {len(rin_points) - 10} điểm khác")
+
+            log_print("\n--- DEBUG: Các điểm nằm trên Rout (R=39mm) ---")
+            rout_points = [(pid, x, y) for pid, (x, y) in point_coords.items() if is_on_rout(x, y)]
+            for pid, x, y in rout_points[:10]:
+                log_print(f"    Point[{pid}]: ({x}, {y}) - R²={x*x+y*y:.2f}")
+            if len(rout_points) > 10:
+                log_print(f"    ... và {len(rout_points) - 10} điểm khác")
+
+            # Tạo lines cho mỗi tam giác
+            log_print(f"\n>>> Đang tạo lines cho {len(elements)} tam giác...")
+
+            # Log lệnh Line đầu tiên
+            n1, n2, n3 = elements[0]
+            p1, p2, p3 = node_to_point[n1], node_to_point[n2], node_to_point[n3]
+            log_print(f"    Lệnh Line đầu tiên: LineSegment(defPoint=[Point[{p1}], Point[{p2}]], nature=Nature['STANDARD'])")
+
+            line_cache = set()  # Để tránh tạo line trùng
+            skipped_boundary_lines = 0  # Đếm số lines bị skip vì cả 2 đều là boundary
+
+            # DEBUG: Log 10 elements đầu tiên với mapping
+            log_print("\n--- DEBUG: 10 elements đầu tiên (node -> point) ---")
+            for i, (n1, n2, n3) in enumerate(elements[:10]):
+                p1, p2, p3 = node_to_point[n1], node_to_point[n2], node_to_point[n3]
+                log_print(f"    Element {i+1}: nodes({n1},{n2},{n3}) -> points({p1},{p2},{p3})")
+
+            for elem_idx, (n1, n2, n3) in enumerate(elements):
+                # Lấy point IDs tương ứng
+                p1 = node_to_point[n1]
+                p2 = node_to_point[n2]
+                p3 = node_to_point[n3]
+
+                # Tạo 3 lines cho tam giác (nếu chưa có)
+                edges = [(p1, p2), (p2, p3), (p3, p1)]
+
+                for edge in edges:
+                    # Sắp xếp để tránh trùng lặp (p1, p2) vs (p2, p1)
+                    edge_key = tuple(sorted(edge))
+                    if edge_key not in line_cache:
+                        # Lấy tọa độ của 2 điểm
+                        x1, y1 = point_coords.get(edge[0], (0, 0))
+                        x2, y2 = point_coords.get(edge[1], (0, 0))
+
+                        # Skip nếu CẢ HAI điểm đều nằm trên CÙNG đường tròn (Rin hoặc Rout)
+                        both_on_rin = is_on_rin(x1, y1) and is_on_rin(x2, y2)
+                        both_on_rout = is_on_rout(x1, y1) and is_on_rout(x2, y2)
+
+                        if both_on_rin or both_on_rout:
+                            skipped_boundary_lines += 1
+                            line_cache.add(edge_key)  # Vẫn thêm vào cache để không check lại
+                            if skipped_boundary_lines <= 10:
+                                circle = "Rin" if both_on_rin else "Rout"
+                                log_print(f"    SKIP ({circle}): Point[{edge[0]}] ({x1},{y1}) - Point[{edge[1]}] ({x2},{y2})")
+                            continue
+
+                        cmd = f"LineSegment(defPoint=[Point[{edge[0]}], Point[{edge[1]}]], nature=Nature['STANDARD'])"
+                        flux.run_command(cmd)
+                        line_cache.add(edge_key)
+
+                        # DEBUG: Log 20 lines đầu tiên
+                        if len(line_cache) - skipped_boundary_lines <= 20:
+                            log_print(f"    Line: Point[{edge[0]}] - Point[{edge[1]}]")
+
+                # Debug: in ra mỗi 500 element
+                if (elem_idx + 1) % 500 == 0:
+                    log_print(f"    Đã xử lý {elem_idx + 1} elements, tạo {len(line_cache)} lines")
+
+            log_print(f">>> Đã tạo {len(line_cache) - skipped_boundary_lines} lines")
+            log_print(f">>> Bỏ qua {skipped_boundary_lines} lines (cả 2 điểm đều trên Rin/Rout)")
+
+            # Tạm bỏ buildFaces để test save
+            # log_print("\n>>> Đang build faces...")
+            # flux.run_command("buildFaces()")
+            # log_print(">>> Build faces xong!")
+
+            # Lưu file
+            log_print(f"\n>>> Đang lưu project: {output_path}")
+            flux.run_command(f'saveProjectAs("{output_path}")')
+            log_print(">>> Lưu xong!")
+
+        log_print("\n--- KẾT THÚC ---")
+
+        # Check file sau khi đóng Flux
+        import os
+        if os.path.exists(output_path):
+            size = os.path.getsize(output_path)
+            log_print(f"FILE TỒN TẠI: {output_path}")
+            log_print(f"Kích thước: {size} bytes")
         else:
-            e.material = Material.IRON
+            log_print(f"!!! FILE KHÔNG TỒN TẠI: {output_path}")
 
-
-# ============================================================================
-# Geometry helpers
-# ============================================================================
-def element_to_polygon(elem, nodes, scale):
-    coords = [(nodes[n][0] * scale, nodes[n][1] * scale) for n in elem.corner_nodes]
-    coords.append(coords[0])
-    try:
-        p = Polygon(coords)
-        return p.buffer(0) if not p.is_valid else p
-    except:
-        return None
-
-
-def mirror_polygon_45(poly):
-    """Mirror across y=x line: (x,y) -> (y,x)"""
-    if poly.is_empty or not poly.is_valid:
-        return poly
-    ext = [(y, x) for x, y in poly.exterior.coords]
-    ints = [[(y, x) for x, y in interior.coords] for interior in poly.interiors]
-    try:
-        m = Polygon(ext, ints)
-        return m.buffer(0) if not m.is_valid else m
-    except:
-        return Polygon()
-
-
-def polygon_to_list(geom):
-    """Convert Polygon/MultiPolygon to list of Polygons"""
-    if isinstance(geom, Polygon):
-        return [geom] if geom.is_valid and not geom.is_empty else []
-    elif isinstance(geom, MultiPolygon):
-        return [p for p in geom.geoms if p.is_valid and not p.is_empty]
-    return []
-
-
-# ============================================================================
-# DXF Export
-# ============================================================================
-def write_dxf(out_path: str, polygons: List[Polygon], layer: str = "REGION"):
-    """Write polygons to DXF - each polygon as closed polyline"""
-    
-    def polyline_dxf(coords, layer_name):
-        if len(coords) < 3:
-            return []
-        lines = ["0", "POLYLINE", "8", layer_name, "66", "1", "70", "1",
-                 "10", "0.0", "20", "0.0", "30", "0.0"]
-        for x, y in coords:
-            lines.extend(["0", "VERTEX", "8", layer_name,
-                         "10", f"{x:.12g}", "20", f"{y:.12g}", "30", "0.0"])
-        lines.extend(["0", "SEQEND"])
-        return lines
-    
-    # Header
-    content = [
-        "0", "SECTION", "2", "HEADER",
-        "9", "$ACADVER", "1", "AC1009",
-        "0", "ENDSEC",
-        # Tables
-        "0", "SECTION", "2", "TABLES",
-        "0", "TABLE", "2", "LTYPE", "70", "1",
-        "0", "LTYPE", "2", "CONTINUOUS", "70", "0", "3", "Solid", "72", "65", "73", "0", "40", "0.0",
-        "0", "ENDTAB",
-        "0", "TABLE", "2", "LAYER", "70", "1",
-        "0", "LAYER", "2", layer, "70", "0", "62", "7", "6", "CONTINUOUS",
-        "0", "ENDTAB",
-        "0", "ENDSEC",
-        # Blocks
-        "0", "SECTION", "2", "BLOCKS", "0", "ENDSEC",
-        # Entities
-        "0", "SECTION", "2", "ENTITIES",
-    ]
-    
-    for poly in polygons:
-        if poly.exterior:
-            content.extend(polyline_dxf(list(poly.exterior.coords), layer))
-        for interior in poly.interiors:
-            content.extend(polyline_dxf(list(interior.coords), layer))
-    
-    content.extend(["0", "ENDSEC", "0", "EOF", ""])
-    
-    with open(out_path, "w") as f:
-        f.write("\n".join(content))
-    
-    print(f"  Wrote: {out_path} ({len(polygons)} polygons)")
-
-
-# ============================================================================
-# Main
-# ============================================================================
-def main(tra_path: str, output_dir: str = "."):
-    print("=" * 60)
-    print("Export AIR và IRON riêng biệt")
-    print("=" * 60)
-    
-    # Load
-    print("\n1. Loading mesh...")
-    nodes = parse_tra_nodes(tra_path)
-    elements = parse_tra_elements(tra_path)
-    print(f"   {len(nodes)} nodes, {len(elements)} elements")
-    
-    radii = [np.sqrt(x**2 + y**2) for x, y in nodes.values()]
-    r_min, r_max = min(radii), max(radii)
-    
-    # NGnet
-    print("\n2. NGnet setup...")
-    config = NGnetConfig(
-        r_min=r_min + (r_max - r_min) * 0.1,
-        r_max=r_max - (r_max - r_min) * 0.1,
-        theta_min=0,
-        theta_max=np.pi / 4,
-        n_radial=6,
-        n_angular=5,
-    )
-    ngnet = NGnet(config)
-    ngnet.set_random_weights(seed=42)
-    
-    # Assign materials
-    print("\n3. Assigning materials...")
-    assign_materials(elements, nodes, ngnet)
-    n_iron = sum(1 for e in elements if e.material == Material.IRON)
-    n_air = sum(1 for e in elements if e.material == Material.AIR)
-    print(f"   Iron: {n_iron}, Air: {n_air}")
-    
-    # Convert to polygons
-    print("\n4. Building polygons...")
-    iron_polys = []
-    air_polys = []
-    all_polys = []
-    
-    for e in elements:
-        p = element_to_polygon(e, nodes, DXF_SCALE)
-        if p and p.is_valid and not p.is_empty:
-            all_polys.append(p)
-            if e.material == Material.IRON:
-                iron_polys.append(p)
-            else:
-                air_polys.append(p)
-    
-    # Merge
-    print("\n5. Merging...")
-    
-    # Total region (all elements)
-    print("   Merging total...")
-    total_union = unary_union(all_polys)
-    total_mirrored = mirror_polygon_45(total_union) if isinstance(total_union, Polygon) else unary_union([mirror_polygon_45(p) for p in polygon_to_list(total_union)])
-    total_final = unary_union([total_union, total_mirrored])
-    total_list = polygon_to_list(total_final)
-    print(f"   -> Total: {len(total_list)} region(s)")
-    
-    # AIR regions
-    print("   Merging AIR...")
-    if air_polys:
-        air_union = unary_union(air_polys)
-        air_mirrored = mirror_polygon_45(air_union) if isinstance(air_union, Polygon) else unary_union([mirror_polygon_45(p) for p in polygon_to_list(air_union)])
-        air_final = unary_union([air_union, air_mirrored])
-        air_list = polygon_to_list(air_final)
-    else:
-        air_final = Polygon()
-        air_list = []
-    print(f"   -> AIR: {len(air_list)} region(s)")
-    
-    # IRON = Total - AIR
-    print("   Computing IRON = Total - AIR...")
-    if air_final and not air_final.is_empty:
-        iron_final = total_final.difference(air_final)
-    else:
-        iron_final = total_final
-    iron_list = polygon_to_list(iron_final)
-    print(f"   -> IRON: {len(iron_list)} region(s)")
-    
-    # Simplify
-    simplify_tol = 0.1
-    air_list = [p.simplify(simplify_tol) for p in air_list]
-    iron_list = [p.simplify(simplify_tol) for p in iron_list]
-    
-    # Export
-    print("\n6. Exporting DXF files...")
-    air_path = os.path.join(output_dir, "air_regions.dxf")
-    iron_path = os.path.join(output_dir, "iron_regions.dxf")
-    
-    write_dxf(air_path, air_list, layer="AIR")
-    write_dxf(iron_path, iron_list, layer="IRON")
-    
-    # Visualization
-    print("\n7. Creating preview...")
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Polygon as MplPoly
-        
-        fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=150)
-        
-        # AIR
-        ax1 = axes[0]
-        ax1.set_aspect("equal")
-        ax1.set_title(f"AIR regions ({len(air_list)})")
-        for p in air_list:
-            if p.exterior:
-                ax1.fill(*zip(*p.exterior.coords), facecolor='lightyellow', 
-                        edgecolor='orange', linewidth=1.5)
-                for interior in p.interiors:
-                    ax1.fill(*zip(*interior.coords), facecolor='white', 
-                            edgecolor='orange', linewidth=1)
-        ax1.autoscale()
-        ax1.set_xlabel("x (mm)")
-        ax1.set_ylabel("y (mm)")
-        
-        # IRON
-        ax2 = axes[1]
-        ax2.set_aspect("equal")
-        ax2.set_title(f"IRON regions ({len(iron_list)})")
-        for p in iron_list:
-            if p.exterior:
-                ax2.fill(*zip(*p.exterior.coords), facecolor='steelblue', 
-                        edgecolor='darkblue', linewidth=1.5)
-                for interior in p.interiors:
-                    ax2.fill(*zip(*interior.coords), facecolor='white', 
-                            edgecolor='darkblue', linewidth=1)
-        ax2.autoscale()
-        ax2.set_xlabel("x (mm)")
-        ax2.set_ylabel("y (mm)")
-        
-        plt.tight_layout()
-        png_path = os.path.join(output_dir, "air_iron_preview.png")
-        fig.savefig(png_path)
-        plt.close()
-        print(f"  Wrote: {png_path}")
     except Exception as e:
-        print(f"  Preview failed: {e}")
-    
-    print("\n" + "=" * 60)
-    print("DONE!")
-    print(f"\nFiles để import vào Flux:")
-    print(f"  1. {air_path}  <- Import trước, gán vật liệu AIR")
-    print(f"  2. {iron_path} <- Import sau, gán vật liệu IRON")
-    print("=" * 60)
+        log_print(f"\n!!! LỖI: {type(e).__name__}: {e}")
+        import traceback
+        log_print(traceback.format_exc())
+
+    finally:
+        log.close()
 
 
 if __name__ == "__main__":
-    import sys
-    tra = sys.argv[1] if len(sys.argv) > 1 else "rotor_2.TRA"
-    if os.path.exists(tra):
-        main(tra)
-    else:
-        print(f"File not found: {tra}")
+    main()
